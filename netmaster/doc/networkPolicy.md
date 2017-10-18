@@ -18,7 +18,7 @@ Following are components which required to implement this feature :
 +----+---------+-----+
      |         ^
      |         |                         +----------------+
-     1         2                         |  MemCached     |                                                                       ++
+     1         2                         |  MemCached     |
      |         |        +--------3------->  (Label to Ips)|
      |         |        |                |                |
 +----v---------+--------+                +----------------+
@@ -36,32 +36,4 @@ Following are components which required to implement this feature :
  |(Insert Policy Rules)   |
  |                        |
  +------------------------+
-
 ```
-
-
-<h4>Packetflow</h4>
-
- * netplugin data path receives DNS msg from container
- * netplugin looks up the name in local cache
- * if there is any entry, DNS response is sent out
- * if there is no entry then the original DNS request is forwarded
-
-```
-                            +--------------------+
-                            |DNS lookup:         |
-                            |   #LB Service names|
-                            |   #EPG names       |
-                            |   #Container names |
-                            +--------------------+
-                          DNS ^  |DNS       |DNS
-                          Req |  |Resp      |Fwd (lookup failed)
-                              |  v          v
-                            +-+------------------+
-+-----------+      DNS Req  |                    |       DNS Fwd   +-------------+
-|           |-------------->|     Netplugin      +---------------->|  External   |
-|Container#1|               |     datapath       |                 |  DNS        |
-|           |<--------------|                    |<----------------+             |
-+-----------+ DNS Resp      +--------------------+       DNS Resp  +-------------+
-```
-
