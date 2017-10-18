@@ -55,6 +55,7 @@ With above design approach, Netmaster(Policy Watcher) listen for policy events a
 ```
    
  <h4>Policy update event :</h4>   
+
 ```
 1. Parse received event 
 2. Update Label memcached if required.
