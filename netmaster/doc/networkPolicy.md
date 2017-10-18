@@ -11,37 +11,38 @@ Following are components which required to implement this feature :
 <h4>Software Arch</h4>
 
 ```
- +--------------------+
- |                    |
- |     K8s Api Ser^er |
- |                    |
- +----+---------+-----+
-      |         ^                  +------------------------+
-      +         +                  | Pods Events            |
-      1         2        +1+-------+ Create/Update/Delete   |
-      +         +        |         +------------------------+
-      |         |        v
- +----v---------+-------+
- | Netmaster             +
- | (Policy Watcher)      +---------+3+---------+
- +--------+--------------+                     |
-          |                                  +-v---------------+
-          +                                  |                 +
-          5                                  |Configured Policy
-          +                                  |DataBase         +
-          |                                  |                 |
-+---------+------------------+               |                 |
-|     Ovs DataPath           |               +-----------------+
-|    ^Policy based ACL^      |
-|                            |
-|                            |
-+----------------------------+
+  +--------------------+
+  |                    |
+  | K8s API Server     |
+  |                    |
+  +----+---------+-----+
+       |         ^                  +------------------------+
+       +         +                  | Pods Events            |
+       1         2        +1+-------+ Create/Update/Delete   |
+       +         +        |         +------------------------+
+       |         |        v
++------+---------+--------++
+|     NetMaster Watcher    |
+|     1. Policy Events     |
+|     2. Pods Events       |                +-- -------------+
+|                          +-------3--------+   Configured   |
++---------------------+----+                |   Policy DB    |
+           5          |                     |                |
+           +          5                     +----------------+
+           |          |
+ +---------+----------v-------+
+ |     Ovs DataPath           |
+ |     Policy based ACL       |
+ |                            |
+ |                            |
+ +----------------------------+
 
 
 ```
 
 There are 2 types of work flow has been identified : 
 1. Policy Event  from API server 
+
 2. Pod Event trigger policy update 
 
 Contiv is using existing  policy based infrasturture to support K8s based network policy.With this approach, Contiv will create a default Policy group implicitly on creation of network and used or implement K8s network policy using EPG. There is no need to specifiy any contiv specific tag in K8s deployment/resource yml. Contiv will mapped network namespace to network.K8s network policy will mapped into  OVS ACL i.e IP to IP or IP to network or network  to network.
