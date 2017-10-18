@@ -11,41 +11,31 @@ Following are components which required to implement this feature :
  
 <h4>Software Arch</h4>
 ```
-  ┌──────────────────────┐                                     
-  │                      │                                     
-  │  K8s Api Server      │                                     
-  └─────────────┬────────┘                                     
-      │         │                                              
-      │         │                                              
-      │    K8s Policy                                          
-      │    Create/Upd                                          
-      │    ate/delete                                          
-   Request      │                                              
-   for IPs      │                       .───────────────.      
-  for Labels    │                   _.─'                 `──.  
-         │      │                  ╱      <MemCached >       ╲ 
-         │      │              ┌─▶(    Labels -> Ips List     )
-         │      │              │   `.                       ,' 
-         │      │              │     `──.               _.─'   
-  ┌──────┴───────────────────┐ │         `─────────────'       
-  │                          │ │                               
-  │ Netmaster Policy Watcher ├─┘                               
-  │                          │               .───────────.     
-  │                          ◀─────┐       ,'             `.   
-  └───────────────┬──────────┘     └──────▶  Policy Cached  )  
-               Policy                      '─.           ,─'   
-             Pushed by                        `─────────'      
-               Master                                          
-               │                                               
-               │                                               
-               │                                               
-        .──────▼──────────.                                    
-  _.───'                   `────.                              
- ╱                               ╲                             
-(          OVS DataPath           )                            
- `.                             ,'                             
-   `────.                 _.───'                               
-         `───────────────'                                     
++--------------------+
+|                    |
+|     K8s Api Server |
+|                    |
++----+---------+-----+
+     |         ^
+     |         |                         +----------------+
+     1         2                         |  MemCached     |                                                                       ++
+     |         |        +--------3------->  (Label to Ips)|
+     |         |        |                |                |
++----v---------+--------+                +----------------+
+| Netmaster             |
+| (Policy Watcher)      +----------4----------+
++--------+--------------+                     |
+         |                                  +-v---------------+
+         |                                  |                 |
+         5                                  |Configured Policy
+         |                                  |DataBase         |
+         |                                  |                 |
+ +-------v----------------+                 |                 |
+ |                        |                 +-----------------+
+ |OVS DataPath            |
+ |(Insert Policy Rules)   |
+ |                        |
+ +------------------------+
 
 ```
 
