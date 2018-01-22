@@ -87,3 +87,8 @@ func getDefaultToken() (string, error) {
 	}
 	return string(bytes), nil
 }
+
+// PolicyToRuleID generate rule id from policy details
+func PolicyToRuleIDUsingGroups(InGroup, FromGroup string, port int, protocol, policyName string) string {
+	return policyName + "-" + InGroup + "-" + FromGroup
+}
