@@ -36,7 +36,7 @@ type k8sPodSelector struct {
 	PolicyName   string //Attach to policy
 	labelPodMap  map[string]map[string]bool
 	podIps       map[string]string
-	labelSelList []string
+	labelSelList []string //List of label string
 	groupList    []string
 }
 type k8sEndPointGroupInfo struct {
@@ -431,9 +431,42 @@ func (k8sNet *k8sContext) deleteRule(tenantName string,
 
 	return nil
 }
+func (k8sNet *k8sContext) processK8sNamespace(
+	opCode watch.EventType, ns *v1.Namespace) {
+	if np.Namespace == "kube-system" { //skip system namespace
+		return
+	}
+	npLog.Infof("Recv Namespace resource Update[%+v]:%+v ", opCode, *ns)
+	switch opCode {
+	case watch.Added, watch.Modified:
+		k8sNet.addNamespace(ns)
+	case watch.Deleted:
+		k8sNet.deleteNamespace(ns)
+	}
+}
+func (k8sNet *k8sContext) addNamespace(ns *v1.Namespace) {
+	npLog.Infof("Add NameSpace request :%v", ns.Namespace)
+	if err := k8sNet.contivClient.TenantPost(
+		&contivClient.Tenant{TenantName: ns.Namespace}); err != nil {
+		npLog.Errorf("Failed to create Tenant for :%v namespace",
+			ns.Namespace)
+		return
+	}
+	npLog.Infof("Tenant created for NameSpace :%v", ns.Namespace)
+}
+func (k8sNet *k8sContext) deleteNamespace(ns *v1.Namespace) {
+	npLog.Infof("Delete NameSpace request: %+v", ns.Namespace)
+	if err := k8sNet.contivClient.TenantDelete(
+		&contivClient.Tenant{TenantName: ns.Namespace}); err != nil {
+		npLog.Errorf("Failed to delete Tenant for :%v namespace",
+			ns.Namespace)
+		return
+	}
+	npLog.Infof("Tenant deleted for Namespace %v", ns.Namespace)
+}
 
 //Sub handler to process  Network Policy event from K8s srv
-func (k8sNet *k8sContext) processK8sNetworkPolicy(
+func (k8sNet *k8sContext) perocessK8sNetworkPolicy(
 	opCode watch.EventType, np *network_v1.NetworkPolicy) {
 	if np.Namespace == "kube-system" { //not applicable for system namespace
 		return
@@ -545,6 +578,13 @@ func (k8sNet *k8sContext) createGroupFromLabelsSet(nameSpace string,
 		groups)
 	return groups
 }
+
+//XXX: this API  internally  do following
+//Case 1: Call some external API which return it Set of EndPoint Group
+//Which has been created and matched with given Label String Set
+//Case 2 : Call state driver ETCD  for GroupList Obj
+//Current Below API should be deprecated  and currently used only for
+//Code understanding
 func (k8sNet *k8sContext) getGroupSetFromLabelSet(nameSpace string,
 	labelSelectors []string) []uint64 {
 	groupMap := make(map[uint64]bool, 0)
@@ -626,27 +666,9 @@ func (k8sNet *k8sContext) getMatchFromSpecPartNetPolicy(
 	return fromPartPolicy
 }
 
-//Consolidate all Ips belongs to Label for Pod Selector object
-func (k8sNet *k8sContext) updatePodSelectorPodIps(
-	podSelector *k8sPodSelector) {
-	if podSelector == nil {
-		npLog.Errorf(" nil pod Selector  reference")
-		return
-	}
-	for _, ipMap := range podSelector.labelPodMap {
-		for ip := range ipMap {
-			podSelector.podIps[ip] = ip
-		}
-	}
-	npLog.Infof("Update Pod SelectorPodIps %+v", podSelector.labelPodMap)
-	return
-}
-
 //Process Pod Delete Event from K8s Srv
 func (k8sNet *k8sContext) processPodDeleteEvent(pod *v1.Pod) {
-	podInfo := parsePodInfo(pod)
 	labelList := podInfo.labelSelectors
-	rmIps := []string{podInfo.IP}
 	npLog.Infof("POD [Delete] for pods:%+v", pod)
 	//find All configured Network Policy object which given pods LableMap
 	//match
@@ -654,25 +676,23 @@ func (k8sNet *k8sContext) processPodDeleteEvent(pod *v1.Pod) {
 	toSpecNetPolicy := k8sNet.getMatchToSpecPartNetPolicy(podInfo)
 	if len(toSpecNetPolicy) > 0 {
 		for _, nw := range toSpecNetPolicy {
-			//remove Given Pods Ips from List
-			delete(nw.PodSelector.podIps, podInfo.IP)
-			//revisit all configur label Ips list in pod
-			//Selector object
-			k8sNet.getIpListMatchPodSelector(nw.PodSelector,
-				labelList, podInfo.IP)
-			//Remove Pods Ips from Label Map Table
-			//Update PodSelector podIps list
-			k8sNet.updatePodSelectorPodIps(nw.PodSelector)
 
+			//Get Target PodSelector Groupset Info
+			toGroupInfo := k8sNet.getGroupSetFromLabelSet(nw.PodSelector.TenantName,
+				podInfo.labelSelectors)
+			//Convert ToGroupInfo Id into string Slice
+			toGroup := []string{}
+			for id := range toGroupInfo {
+				toGroup = append(toGroup, strconv.Itoa(id))
+			}
 			rList := k8sNet.
-				buildRulesFromIngressSpec(nw,
+				buildRuleFromIngressGroupSet(nw,
 					nw.PodSelector.PolicyName)
-			npLog.Infof("remove Pods ToSpec :%+v", rmIps)
-			ruleList := k8sNet.
-				finalIngressNetworkPolicyRule(
-					nw, rmIps, *rList, false)
+			//Build Final policy rule and pushed to Contiv system
+			ruleList := k8sNet.finalGroupBaseNetworkPolicyRule(np, toGroupSet,
+				rList, false)
+			npLog.Infof("final rules :%v", ruleList)
 			npLog.Infof("Delete To Spec rule:%+v", ruleList)
-			npLog.Infof("rmove PodIps from ToSpec", podInfo.IP)
 		}
 	} else { //Pods  belongs fromPart of Spec
 		fromPartPolicy := k8sNet.getMatchFromSpecPartNetPolicy(podInfo)
@@ -682,17 +702,13 @@ func (k8sNet *k8sContext) processPodDeleteEvent(pod *v1.Pod) {
 			npLog.Infof("remove PodIps:%v fromSpec part of Policy",
 				rmIps)
 			for _, nw := range fromPartPolicy {
-				k8sNet.rmIpFromSpecPodSelector(nw,
-					labelList, podInfo.IP)
 				rList := k8sNet.
-					buildIngressRuleToPodSelector(nw, rmIps,
+					buildRuleFromIngressGroupSet(nw,
 						nw.PodSelector.PolicyName)
 				npLog.Infof("Ingress Rule :%+v", *rList)
-				npLog.Infof("Pods Info in To Spec :%+v", rmIps)
-				ipList := getIpMapToSlice(nw.PodSelector.podIps)
-				ruleList := k8sNet.
-					finalIngressNetworkPolicyRule(nw,
-						ipList, *rList, false)
+				//Build Final policy rule and pushed to Contiv system
+				ruleList := k8sNet.finalGroupBaseNetworkPolicyRule(np, toGroupSet,
+					rList, false)
 				npLog.Infof("Pod rules:%+v", ruleList)
 			}
 		}
@@ -747,35 +763,6 @@ func (k8sNet *k8sContext) rmIpFromSpecPodSelector(
 	return
 }
 
-//Add Pods Ips and readjuct Pod selector podIps list
-func (k8sNet *k8sContext) addPodIpsToSpecPodSelector(nw *k8sNetworkPolicy,
-	label []string, ip string) {
-	for _, l := range label {
-		if ipMap, ok := nw.PodSelector.labelPodMap[l]; ok {
-			ipMap[ip] = true
-		}
-	}
-	//Recalculate PodSelector PodIps list
-	for _, lMap := range nw.PodSelector.labelPodMap {
-		//At each Label Walk all its Ips
-		for ip := range lMap {
-			nw.PodSelector.podIps[ip] = ip
-		}
-	}
-	return
-}
-
-//return list of Ips which belongs to given lable in PodSelector Object
-func (k8sNet *k8sContext) getIpListMatchPodSelector(podSelector *k8sPodSelector,
-	label []string, ip string) {
-	for _, l := range label {
-		if ipMap, ok := podSelector.labelPodMap[l]; ok {
-			ipMap[ip] = true
-		}
-	}
-	return
-}
-
 //Process Pod Add event ; Modify version based On group Info
 func (k8sNet *k8sContext) processPodAddEvent(pod *v1.Pod) {
 	if pod.Status.PodIP == "" {
@@ -797,6 +784,10 @@ func (k8sNet *k8sContext) processPodAddEvent(pod *v1.Pod) {
 
 	//lookup for group for recv pod if not found then create new one and
 	//cache it
+	//XXX: Below block should just call APIs to get GroupSet Info
+	//by passing Label selector information of Pods
+	//That APis either should be implemented in Netmaster or
+	//Use state Driver object to get this Pods Group set information
 	if ok := k8sNet.lookupGroupFromLabelsSet(podInfo.nameSpace,
 		podInfo.labelSelectors); !ok {
 		//Looks like new group info
@@ -808,43 +799,33 @@ func (k8sNet *k8sContext) processPodAddEvent(pod *v1.Pod) {
 
 	npLog.Infof("POD [ADD] request for pod %+v", pod)
 	//get programmed  NetworkPolicy for recv Pod Namespace
-	//find All configured Policy which is having given pods Label selector
-	// is part of To spec
 	toPartPolicy := k8sNet.getMatchToSpecPartNetPolicy(podInfo)
 	npLog.Infof("ToPartSpec:%+v", toPartPolicy)
-	//Pods Belongs to To Spec part
-	podIps := []string{podInfo.IP}
 
 	if len(toPartPolicy) > 0 {
+		//Pods belongs to Policy which has Pods Label as Target
 		npLog.Infof("Recv Pod belongs to ToSpec part of Policy")
+		//Walk all found Policy
 		for _, nw := range toPartPolicy {
 			rList := k8sNet.buildRulesFromIngressSpec(nw,
 				nw.PodSelector.PolicyName)
 			if len(*rList) > 0 {
 				npLog.Infof("Pods Info in To Spec :%+v",
 					nw.PodSelector.podIps)
-				//if _, ok := nw.PodSelector.podIps[podInfo.IP]; ok {
-				//	npLog.Infof("pod Ips already exist", podInfo.IP)
-				//	continue
 				//Get Target PodSelector Groupset Info
 				toGroupInfo := k8sNet.getGroupSetFromLabelSet(np.PodSelector.TenantName,
 					podInfo.labelSelectors)
-				//}
-				//ruleList := k8sNet.finalIngressNetworkPolicyRule(
-				//	nw, podIps, *rList, true)
 				//Convert ToGroupInfo Id into string Slice
 				toGroup := []string{}
 				for id := range toGroupInfo {
 					toGroup = append(toGroup, strconv.Itoa(id))
 				}
 
-				ruleList := k8sNet.finalGroupBaseNetworkPolicyRule(nw, toGroup)
+				ruleList := k8sNet.finalGroupBaseNetworkPolicyRule(nw, toGroup, rList, true)
 				npLog.Infof("To Spec Pod rules:%+v", ruleList)
 				npLog.Infof("podInf.labelSelectors:%+v",
 					podInfo.labelSelectors)
 			}
-			k8sNet.addPodIpsToSpecPodSelector(nw,
-				podInfo.labelSelectors, podInfo.IP)
 		}
 	} else {
 		//Build fromPodSelector List
@@ -852,20 +833,17 @@ func (k8sNet *k8sContext) processPodAddEvent(pod *v1.Pod) {
 		//Build Rules and update to OVS
 		for _, nw := range fromPartPolicy {
 			npLog.Infof("fromPartPolicy:%+v", *nw)
-			rList := k8sNet.buildIngressRuleToPodSelector(nw,
-				podIps,
+			rList := k8sNet.buildRulesFromIngressSpec(nw,
 				nw.PodSelector.PolicyName)
 			if len(*rList) > 0 {
 				npLog.Infof("Ingress Rule :%+v", *rList)
 				npLog.Infof("Pods Info in To Spec :%+v",
 					nw.PodSelector.podIps)
 				ipList := getIpMapToSlice(nw.PodSelector.podIps)
-				ruleList := k8sNet.finalIngressNetworkPolicyRule(nw,
-					ipList, *rList, true)
+				ruleList := k8sNet.finalGroupBaseNetworkPolicyRule(nw, toGroup,
+					rList, true)
 				npLog.Infof("Pod rules:%+v", ruleList)
 			}
-			k8sNet.UpdateIpListFromSpecfromLabel(nw,
-				podInfo.labelSelectors, podInfo.IP)
 		}
 	}
 }
@@ -882,6 +860,8 @@ func (k8sNet *k8sContext) processK8sEvent(opCode watch.EventType,
 
 	case *v1.Pod:
 		k8sNet.processK8sPods(opCode, objType)
+	case *v1.Namespace:
+		k8sNet.processK8sNamespace(opCode, objType)
 	case *network_v1.NetworkPolicy:
 		k8sNet.processK8sNetworkPolicy(opCode, objType)
 	default:
@@ -898,7 +878,8 @@ func (k8sNet *k8sContext) watchK8sEvents(errChan chan error) {
 		time.Sleep(time.Millisecond * 100)
 	}
 	//Set Watcher for Network Policy resource
-	npWatch, err := k8sNet.k8sClientSet.Networking().NetworkPolicies("").Watch(meta_v1.ListOptions{})
+	npWatch, err := k8sNet.k8sClientSet.Networking().
+		NetworkPolicies("").Watch(meta_v1.ListOptions{})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to watch network policy, %s", err)
 		return
@@ -912,6 +893,18 @@ func (k8sNet *k8sContext) watchK8sEvents(errChan chan error) {
 
 	selCase = append(selCase, reflect.SelectCase{Dir: reflect.SelectRecv,
 		Chan: reflect.ValueOf(podWatch.ResultChan())})
+
+	//Set Watcher for namespace creation
+	nsWatch, err := k8sNet.k8sClientSet.CoreV1().
+		NameSpace("").Watch(meta_v1.ListOptions{})
+	if err != nil {
+		errChan <- fmt.Errorf("failed to watch NameSpace resource %s", err)
+		return
+	}
+
+	selCase = append(selCase, reflect.SelectCase{Dir: reflect.SelectRecv,
+		Chan: reflect.ValueOf(nsWatch.ResultChan())})
+
 	for {
 		_, recVal, ok := reflect.Select(selCase)
 		if !ok {
@@ -983,6 +976,7 @@ func (k8sNet *k8sContext) addNetworkPolicy(np *network_v1.NetworkPolicy) {
 		k8sNet.delNetworkPolicy(np)
 	}
 
+	//Target Pod Selector Label Parsing and GroupSet lookup
 	npPodSelector, err := k8sNet.parsePodSelectorForGroupSet(
 		np.Spec.PodSelector.MatchLabels,
 		np.Namespace)
@@ -996,9 +990,10 @@ func (k8sNet *k8sContext) addNetworkPolicy(np *network_v1.NetworkPolicy) {
 	npLog.Infof("Network  policy [%s] pod-selector: %+v",
 		np.Name, npPodSelector)
 
-	//Parse Ingress Policy rules
 	for policyType := range np.Spec.PolicyTypes {
+		//XXX: This version only support Ingress NetworkPolicy
 		if policyType == PolicyTypeIngress {
+			//Parse Ingress Policy
 			IngressRules, err :=
 				k8sNet.parseIngressPolicy(np.Spec.Ingress,
 					np.Namespace)
@@ -1007,10 +1002,10 @@ func (k8sNet *k8sContext) addNetworkPolicy(np *network_v1.NetworkPolicy) {
 				return
 			}
 			nwPolicy := k8sNetworkPolicy{
-				PodSelector: npPodSelector,
+				PodSelector: npPodSelector, //Target PodSelector
 				Ingress:     IngressRules}
 
-			npLog.Info("Apply NW_Policy[%s] podSelector:%+v Ingress:%+v",
+			npLog.Info("Apply nwPolicy[%s] TargetPod:%+v Ingress:%+v",
 				np.Name, npPodSelector, IngressRules)
 
 			//Push policy info to ofnet agent
@@ -1040,55 +1035,63 @@ func (k8sNet *k8sContext) addNetworkPolicy(np *network_v1.NetworkPolicy) {
 func (k8sNet *k8sContext) buildRuleFromIngressGroupSet(
 	np *k8sNetworkPolicy,
 	policyName string) (lRules *[]client.Rule) {
+
 	var listRules []client.Rule
-	for _, ingress := range np.Ingress {
-		isPortsCfg := false
-		if len(ingress.Ports) > 0 {
-			isPortsCfg = true
-			//Is Port Cfg included into From Ingress Spec
-		}
-		for _, from := range ingress.From {
-			//PodSelector label
-			if from.IngressPodSelector != nil {
-				groupSet := from.IngressPodSelector.groupList
-				//Ingress Pod Selector
-				for _, fromGroup := range groupSet {
-					rule := client.Rule{
-						TenantName:        np.PodSelector.TenantName,
-						PolicyName:        np.PodSelector.PolicyName,
-						FromEndpointGroup: fromGroup,
-						Priority:          defaultPolicyPriority,
-						Direction:         "in",
-						Action:            "allow"}
-					//If Port cfg enable
-					if isPortsCfg {
-						for _, p := range ingress.IngressRules {
-							k8sNet.appendPolicyPorts(&rule, p)
+	for policyType := range np.Spec.PolicyTypes {
+		//XXX: This version only support Ingress NetworkPolicy
+		if policyType == PolicyTypeIngress {
+			for _, ingress := range np.Ingress {
+				isPortsCfg := false
+				if len(ingress.Ports) > 0 {
+					isPortsCfg = true
+					//Is Port Cfg included into From Ingress Spec
+				}
+				for _, from := range ingress.From {
+					//PodSelector label
+					if from.IngressPodSelector != nil {
+						//Pod Selector case
+						groupSet := from.IngressPodSelector.groupList
+						for _, fromGroup := range groupSet {
+							rule := client.Rule{
+								TenantName:        np.PodSelector.TenantName,
+								PolicyName:        np.PodSelector.PolicyName,
+								FromEndpointGroup: fromGroup,
+								Priority:          defaultPolicyPriority,
+								Direction:         "in",
+								Action:            "allow"}
+							//If Port cfg enable
+							if isPortsCfg {
+								for _, p := range ingress.Ports {
+									k8sNet.appendPolicyPorts(&rule, p)
+									listRules = append(listRules, rule)
+								}
+							} else {
+								listRules = append(listRules, rule)
+							}
+						}
+					} else if from.IngressIpBlockSelector != nil {
+						//CIDR case
+						rule := client.Rule{
+							TenantName:  np.PodSelector.TenantName,
+							PolicyName:  np.PodSelector.PolicyName,
+							FromNetwork: from.IngressIpBlockSelector.CIDR,
+							Priority:    defaultPolicyPriority,
+							Direction:   "in",
+							Action:      "allow"}
+						//If Port cfg enable
+						if isPortsCfg {
+							for _, p := range ingress.Ports {
+								k8sNet.appendPolicyPorts(&rule, p)
+								listRules = append(listRules, rule)
+							}
+						} else {
 							listRules = append(listRules, rule)
 						}
-					} else {
-						listRules = append(listRules, rule)
+					} else if from.IngressNameSelector != nil {
+						//XXX: NameSpace Selector
 					}
 				}
-			} else if from.IngressIpBlockSelector != nil {
-				rule := client.Rule{
-					TenantName:  np.PodSelector.TenantName,
-					PolicyName:  np.PodSelector.PolicyName,
-					FromNetwork: from.IngressIpBlockSelector.CIDR,
-					Priority:    defaultPolicyPriority,
-					Direction:   "in",
-					Action:      "allow"}
-				//If Port cfg enable
-				if isPortsCfg {
-					for _, p := range ingress.IngressRules {
-						k8sNet.appendPolicyPorts(&rule, p)
-						listRules = append(listRules, rule)
-					}
-				} else {
-					listRules = append(listRules, rule)
-				}
-			} else if from.IngressNameSelector != nil {
-				//XXX:TBD
+
 			}
 		}
 
@@ -1179,12 +1182,10 @@ func (k8sNet *k8sContext) finalGroupBaseNetworkPolicyRule(np *k8sNetworkPolicy,
 	var err error
 	ruleList := ingressRules
 
-	//policyCtx := k8sNet.policyRules[np.PodSelector.PolicyName]
-
-	//Ingress Spec To section Pods
+	//Walk to all target Pod Group selector list
 	for _, toGroup := range toGroupSet {
 		npLog.Infof("ruleList:%v", ruleList)
-		//Rebuild Rule List to add To Ips
+		//Complete partial rules by adding Target Pods groups
 		for _, rule := range ruleList {
 			rule.ToEndpointGroup = toGroup
 			if rule.FromEndpointGroup != nil {
@@ -1199,6 +1200,7 @@ func (k8sNet *k8sContext) finalGroupBaseNetworkPolicyRule(np *k8sNetworkPolicy,
 					np.PodSelector.PolicyName)
 
 			}
+			//XXX: Namespace Selector needs to be handled here
 
 			npLog.Infof("RulID:%v", rule.RuleID)
 			//Update Policy Name cache with policy Id
@@ -1315,22 +1317,23 @@ func (k8sNet *k8sContext) finalIngressNetworkPolicyRule(np *k8sNetworkPolicy,
 //Build policy ,rules and attached it to EPG
 func (k8sNet *k8sContext) applyContivNetworkPolicy(np *k8sNetworkPolicy) error {
 	var err error
-	//endPoint Group Lookup(EPG)
+	//endPoint Group (EPG) aka group
 	groupList := np.PodSelector.groupList
+	//Walk for All Pod Selector Endpoint Group List
 	for _, group := range groupList {
+		//Check If; already exist or not if not create one
 		if _, ok := k8sNet.epgName[group]; !ok {
 			//Create EPG then
 			npLog.Infof("EPG :%v doesn't exist create now!", group)
-			if err = k8sNet.createEpgInstance(
-				np.PodSelector.NetworkName, group); err != nil {
-				npLog.Errorf("failed to create EPG %s ", err)
+			if _, err = k8sNet.contivClient.EndpointGroupGet(
+				np.PodSelector.TenantName, group); err != nil {
+				npLog.Errorf("group %s failed in Contiv ", err)
 				return err
 			}
+			k8sNet.epgName[group] = true
 		}
-		//Get PolicyMap using EPG
-		//policyMap := k8sNet.policyPerEpg[np.PodSelector.GroupName]
+		//Get PolicyMap per group
 		policyMap := k8sNet.policyPerEpg[group]
-		//Check if Policy is already programmed in EPG or not
 		if _, ok := k8sNet.networkPolicy[np.PodSelector.PolicyName]; !ok {
 			//Create Policy and published to ofnet controller
 			if err = k8sNet.createPolicy(
@@ -1343,13 +1346,18 @@ func (k8sNet *k8sContext) applyContivNetworkPolicy(np *k8sNetworkPolicy) error {
 			//Cache K8s Configure Policy
 			k8sNet.networkPolicy[np.PodSelector.PolicyName] = np
 
-			//Update Policy Instance in policyMap
+			//Update this new Policy Instance in policyMap
 			policyMap[np.PodSelector.PolicyName] = []string{}
 			attachPolicy := []string{}
+
+			//Walk all configured policy in policyMap table
+			//and Build all configured policy so far added into
+			//group
 			for policyN := range policyMap {
 				attachPolicy = append(attachPolicy, policyN)
 			}
-			//Update EPG with New Policy
+			//Call contiv Client API to update group with new
+			//Policy
 			if err = k8sNet.createEpg(
 				np.PodSelector.NetworkName,
 				np.PodSelector.GroupName, attachPolicy); err != nil {
@@ -1362,17 +1370,19 @@ func (k8sNet *k8sContext) applyContivNetworkPolicy(np *k8sNetworkPolicy) error {
 				np.PodSelector.PolicyName)
 		}
 
+		//Start formulating Rules using Parse Policy Object
 		rList := k8sNet.buildRuleFromIngressGroupSet(np,
 			np.PodSelector.PolicyName)
 
 		npLog.Infof("Build Rules Ingress Spec:%+v, rList:%+v",
-			np.Ingress, *rList)
+			np.Ingress, rList)
 
 		npLog.Infof("Pods Info in To Spec :%+v", np.PodSelector)
 		toGroupSet := np.PodSelector.groupList
 
+		//Build Final policy rule and pushed to Contiv system
 		ruleList := k8sNet.finalGroupBaseNetworkPolicyRule(np, toGroupSet,
-			*rList, true)
+			rList, true)
 		npLog.Infof("final rules :%v", ruleList)
 	}
 	return nil
@@ -1418,51 +1428,54 @@ func (k8sNet *k8sContext) delNetworkPolicy(np *network_v1.NetworkPolicy) {
 	}
 	npLog.Infof("Delete Policy:%s from contiv DB ", np.Name)
 }
+
+//Cleanup Configured k8s NetworkPolicy from contiv system
 func (k8sNet *k8sContext) cleanupContivNetworkPolicy(np *k8sNetworkPolicy) error {
 	var retErr error
 	policyName := np.PodSelector.PolicyName
-	epg := np.PodSelector.GroupName
-	policyMap, ok := k8sNet.policyPerEpg[epg]
-	if !ok {
-		npLog.Errorf("Failed to find epg Policy")
-		return fmt.Errorf("failed to find epg ")
-	}
-	npLog.Infof("Cleanup policyName:%v PolicyPtr:%+v its rules", policyName,
-		policyMap)
-	for _, ruleID := range policyMap[policyName] { //Walk for all configured Rules
-		npLog.Infof("Delete RulID:%v from policy:%v", ruleID, policyName)
-		if err := k8sNet.deleteRule(np.PodSelector.TenantName, policyName, ruleID); err != nil {
-			npLog.Warnf("failed to delete policy: %s rule: %s, %v",
-				policyName, ruleID, err)
+	groupList := np.PodSelector.groupList
+	for _, epg := range groupList {
+		policyMap, ok := k8sNet.policyPerEpg[epg]
+		if !ok {
+			npLog.Errorf("Failed to find epg Policy")
+			return fmt.Errorf("failed to find epg ")
+		}
+		npLog.Infof("Cleanup policyName:%v PolicyPtr:%+v its rules", policyName,
+			policyMap)
+		for _, ruleID := range policyMap[policyName] { //Walk for all configured Rules
+			npLog.Infof("Delete RulID:%v from policy:%v", ruleID, policyName)
+			if err := k8sNet.deleteRule(np.PodSelector.TenantName, policyName, ruleID); err != nil {
+				npLog.Warnf("failed to delete policy: %s rule: %s, %v",
+					policyName, ruleID, err)
+				retErr = err
+			}
+		}
+		delete(policyMap, policyName)
+		attachPolicy := []string{}
+		for policyN := range policyMap {
+			attachPolicy = append(attachPolicy, policyN)
+		}
+		//Unlink Policy From EPG
+		if err := k8sNet.createEpg(np.PodSelector.NetworkName,
+			epg, attachPolicy); err != nil {
+			npLog.Errorf("failed to update EPG %s, %s", epg, err)
 			retErr = err
 		}
-	}
-	delete(policyMap, policyName)
-	attachPolicy := []string{}
-	for policyN := range policyMap {
-		attachPolicy = append(attachPolicy, policyN)
-	}
-	//Unlink Policy From EPG
-	if err := k8sNet.createEpg(np.PodSelector.NetworkName,
-		np.PodSelector.GroupName, attachPolicy); err != nil {
-		npLog.Errorf("failed to update EPG %s, %s",
-			np.PodSelector.GroupName, err)
-		retErr = err
-	}
-	//Delete Policy
-	if err := k8sNet.deletePolicy(policyName); err != nil {
-		npLog.Warnf("failed to delete policy: %s",
-			np.PodSelector.TenantName)
-		retErr = err
+		//Delete Policy
+		if err := k8sNet.deletePolicy(policyName); err != nil {
+			npLog.Warnf("failed to delete policy: %s",
+				np.PodSelector.TenantName)
+			retErr = err
+		}
 	}
 	npLog.Infof("Delete policy:%v ", policyName)
 	return retErr
 }
 
-//parse policy Ports information
+//Parse Ports information from Ingress Policy Port List
 func (k8sNet *k8sContext) getPolicyPorts(
 	policyPort []network_v1.NetworkPolicyPort) []k8sPolicyPorts {
-	rules := []k8sPolicyPorts{}
+	portList := []k8sPolicyPorts{}
 
 	for _, pol := range policyPort {
 		port := 0
@@ -1476,25 +1489,26 @@ func (k8sNet *k8sContext) getPolicyPorts(
 		}
 		npLog.Infof("ingress policy port: protocol: %v, port: %v",
 			protocol, port)
-		rules = append(rules,
+		portList = append(rules,
 			k8sPolicyPorts{Port: port,
 				Protocol: protocol})
 	}
-	return rules
+	npLog.Infof("Total recv Parse Ports: %+v", portList)
+	return portList
 }
-func (k8sNet *k8sContext) getIngressPodSelectorGroupList(
+
+func (k8sNet *k8sContext) getIngressPolicyPeerInfo(
 	peers []network_v1.NetworkPolicyPeer,
 	nameSpace string) ([]*k8sNetworkPolicyPeer, error) {
 	peerPolicy := []k8sNetworkPolicyPeer{}
 
 	npLog.Infof("Ingress Policy Peer Info:%+v", peers)
-
 	if len(peers) <= 0 {
-		return peerPodSelector, fmt.Errorf("empty pod selectors")
+		return peerPolicy, fmt.Errorf("empty pod selectors")
 	}
 
 	for _, from := range peers {
-		//Currently Support for PodSelector
+		//Podselector Case:
 		if from.PodSelector != nil {
 			//Get podSelector Group list
 			s, err := k8sNet.parsePodSelectorForGroupSet(
@@ -1505,9 +1519,16 @@ func (k8sNet *k8sContext) getIngressPodSelectorGroupList(
 			npLog.Infof("Ingress policy pod-selector: %+v", s)
 			peerPolicyInstance := k8sNetworkPolicyPeer{IngressPodSelector: s}
 			peerPolicy = append(peerPolicy, peerPolicyInstance)
-		} else if from.IPBlock != nil {
+		} else if from.IPBlock != nil { //IP Block or CIDR case
 			peerPolicyInstance := k8sNetworkPolicyPeer{IngressIpBlockSelector: from.IPBlock}
 			peerPolicy = append(peerPolicy, peerPolicyInstance)
+		} else if from.NamespaceSelector != nil {
+			peerPolicyInstance := k8sNetworkPolicyPeer{IngressNameSelector: from.NamespaceSelector}
+			peerPolicy = append(peerPolicy, peerPolicyInstance)
+
+		} else {
+			npLog.Errorf("Recv Invalid Ingress Policy info")
+			break
 		}
 	}
 	return &peerPolicy, nil
@@ -1545,22 +1566,23 @@ func (k8sNet *k8sContext) parseIngressPolicy(
 	nameSpace string) ([]k8sIngressRule, error) {
 
 	ingressRules := []k8sIngressRule{}
-	//npLog.Infof("Recv Ingress Policy:=%+v", npIngress)
+	npLog.Infof("Recv Ingress Policy:=%+v", npIngress)
 	if len(npIngress) <= 0 {
 		return ingressRules, fmt.Errorf("no ingress rules")
 	}
 	//Walk in all received Ingress Policys
 	for _, policy := range npIngress {
-		rules := k8sNet.getPolicyPorts(policy.Ports)
-		//build Ingress PodSelector obj
+		//Parse Port Information from recv policy
+		portList := k8sNet.getPolicyPorts(policy.Ports)
+		//build Ingress Peer Obj
 		fromPeer, err := k8sNet.
-			getIngressPodSelectorGroupList(policy.From, nameSpace)
+			getIngressPolicyPeerInfo(policy.From, nameSpace)
 		if err != nil {
 			return []k8sIngress{}, err
 		}
-		npLog.Infof("fromPodSelector:%+v", fromPodSelector)
+		npLog.Infof("Policy PeerInfo:%+v", fromPeer)
 		ingressRules = append(ingressRules,
-			k8sIngressRule{Ports: rules,
+			k8sIngressRule{Ports: portList,
 				From: fromPeer})
 	}
 	return ingressRules, nil
@@ -1610,7 +1632,8 @@ func (k8sNet *k8sContext) initPodSelectorCacheTbl(m map[string]string,
 }
 
 //Create podSelector object and Init its attributes i.e podIps , label etc
-func (k8sNet *k8sContext) parsePodSelectorForGroupSet(labelMap map[string]string,
+func (k8sNet *k8sContext) parsePodSelectorForGroupSet(
+	labelMap map[string]string,
 	nameSpace string) (*k8sPodSelector, error) {
 
 	PodSelector := k8sPodSelector{
@@ -1620,13 +1643,15 @@ func (k8sNet *k8sContext) parsePodSelectorForGroupSet(labelMap map[string]string
 
 	npLog.Infof("Build PodSelector Info using Label:%+v", m)
 	for k, v := range labelMap {
-		PodSelector.labelSelList = append(PodSelector.labelSelList, (k + v))
+		PodSelector.labelSelList = append(PodSelector.labelSelList,
+			(k + v))
 	}
+	//Call Api to get EndGroupList where this Pod could be part of
 	PodSelector.groupList = k8sNet.getGroupSetFromLabelSet(nameSpace,
 		PodSelector.labelSelList)
 
 	npLog.Info("PodSelector: %+v", PodSelector)
-	return &PodSelector, err
+	return &PodSelector, nil
 }
 
 //Create podSelector object and Init its attributes i.e podIps , label etc
